@@ -73,11 +73,29 @@ var actions = {
         },
 
         REQUEST_SIMILAR: () => {
-          actions.SEND_SIMILAR(data.song, peerId)(dispatch, getState)
+          var songId = data.songId
+          var metadata = data.metadata
+          var peerId = peerId
+
+          musicSimilarity(getState().scrapingServers, metadata, function (similar) {
+            if (!similar) {
+              debug('received a request for similarity information we dont hold')
+              actions.REQUEST_SIMILAR_FOR_FRIEND(metadata, songId)(dispatch, getState)
+
+              return
+            }
+
+            peers.send({
+              type: 'SEND_SIMILAR',
+              metadata,
+              similar,
+              songId
+            }, peerId)
+          })
         },
 
         SEND_SIMILAR: () => {
-          actions.RECEIVE_SIMILAR(data.song, data.songs)(dispatch, getState)
+          actions.RECEIVE_SIMILAR(data.metadataHash, data.similar, data.songId)(dispatch, getState)
         },
 
         MULTICAST_SHARING_LEVEL: () => {
@@ -470,28 +488,79 @@ var actions = {
     }
   },
 
-  REQUEST_SIMILAR: (song) => {
-    peers.broadcast({
-      type: 'REQUEST_SIMILAR',
-      song
-    })
-  },
-
-  SEND_SIMILAR: (song, peerId) => {
+  REQUEST_SIMILAR_FOR_FRIEND: (metadata, songId) => {
     return (dispatch, getState) => {
-      musicSimilarity(getState().scrapingServers, song, function (list) {
-        peers.send({
-          type: 'SEND_SIMILAR',
-          song,
-          songs: list
-        }, peerId)
+      var stash = getState().sync.similarsForFriends
+      var rusha = new (require('rusha'))()
+      var metadataHash = rusha.digestFromString(JSON.stringify(metadata))
+
+      var allowedPendingSimilarsForFriends = getState().sync.allowedPendingSimilarsForFriends
+      if (stash.length >= allowedPendingSimilarsForFriends) {
+        debug('list of pending similars for friends too long - we should drop the oldest') // TODO
+
+        /*
+        var oldId = stash[0]
+        var oldSong = getState().songs.find((song) => song.id === oldId)
+
+        if (!oldSong.local && oldSong.favorite !== true) {
+          debug('we probably only kept that similarity information around for a friend - deleting', oldSong.title)
+
+          dispatch({
+            type: 'DELETE'
+          })
+        }
+
+        dispatch({
+          type: 'REMOVE_FROM_SIMILAR_PROVIDING_CHRONOLOGY',
+          songId: oldId
+        })
+        */
+      }
+
+      dispatch({
+        type: 'PUSH_TO_SIMILAR_PROVIDING_CHRONOLOGY',
+        metadataHash
       })
+
+      actions.REQUEST_SIMILAR(metadata, songId)
     }
   },
 
-  RECEIVE_SIMILAR: (song, songs) => {
+  REQUEST_SIMILAR: (metadata, songId) => {
     return (dispatch, getState) => {
-      require('./player.js').SET_RADIO_SONGS(songs, song, true)(dispatch, getState)
+      console.log('REQUEST_SIMILAR', metadata)
+
+      var scrapingServers = getState().scrapingServers
+      if (scrapingServers) {
+        musicSimilarity(scrapingServers, metadata, function (similar) {
+          if (similar.length === 0) {
+            var providers = getState().sync.providers[songId]
+
+            if (!providers) {
+              debug('no providers for song - cannot request metadata information')
+              return
+            }
+
+            debug('asking providers for metadata')
+            providers.forEach((provider) => {
+              peers.send({
+                type: 'REQUEST_SIMILAR',
+                metadata,
+                songId
+              }, provider)
+            })
+            return
+          }
+
+          actions.RECEIVE_SIMILAR(metadata, similar, songId)(dispatch, getState)
+        })
+      }
+    }
+  },
+
+  RECEIVE_SIMILAR: (metadata, similar, songId) => {
+    return (dispatch, getState) => {
+      require('./player.js').SET_RADIO_SONGS(similar, metadata, false)(dispatch, getState)
     }
   },
 
@@ -567,9 +636,9 @@ var actions = {
   MULTICAST_DEVICES: () => {
     return (dispatch, getState) => {
       var devices = getState().devices
-      var friends = getState().friends
 
-      debug('multicasting devices to devices', friends)
+      debug('multicasting devices to devices', devices)
+      if (devices.length === 0) return
       devices.forEach((device) => {
         peers.send({
           type: 'MULTICAST_DEVICES',
